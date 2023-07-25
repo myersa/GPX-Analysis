@@ -1,0 +1,176 @@
+#!/usr/bin/env python
+"""
+Reads a GPS Exchange Format file (*.gpx) and calculates the grade (slope as a percentage with 100% = 45°).
+
+Displays grade and elevation graphs using https://matplotlib.org/ .
+
+References:
+    * https://en.wikipedia.org/wiki/GPS_Exchange_Format
+    * https://www.topografix.com/GPX/1/1/gpx.xsd
+"""
+# TODO detect measurement error
+# TODO line/curve fitting on window points (currently assuming they don't jump around too much)
+
+import datetime
+import logging
+import math
+import sys
+from xml.etree import ElementTree
+
+import matplotlib.pyplot as plt
+
+
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+log = logging.getLogger()
+
+# Number of points to inspect at a time.
+# Timestamp will be taken from the end point.
+WINDOW_SIZE = 5
+
+# https://www.usna.edu/Users/oceano/pguth/md_help/html/approx_equivalents.htm
+METERS_PER_DEGREE = 111000
+
+
+def main():
+    if len(sys.argv) != 2:
+        print("Usage: " + sys.argv[0] + " \"GPX file path\"", file=sys.stderr)
+
+    gpx_file = sys.argv[1]
+    summary_time_series = _process_gpx(gpx_file)
+    _plot_results(summary_time_series)
+
+
+def _process_gpx(gpx_file):
+    root = _preprocess_xml(gpx_file)
+
+    tracked_points = root.findall("trk/trkseg/trkpt")
+
+    if not tracked_points:
+        raise ValueError("No 'trkpt' elements found.")
+
+    n = len(tracked_points)
+
+    log.info("Found %s tracked points", n)
+
+    if len(tracked_points) < WINDOW_SIZE:
+        raise ValueError("Window size (%d) is larger than total number of points (%d)." % (WINDOW_SIZE, n))
+
+    max_grade = float("-inf")
+    max_grade_index = None
+    min_grade = float("inf")
+    min_grade_index = None
+
+    start_time = None
+    cumulative_distance = 0
+    cumulative_time = 0
+
+    # Cache already-read 'hi' elems to avoid re-processing the same ones as 'lo'
+    points_cache = {}
+
+    lo = 0
+    hi = WINDOW_SIZE
+    summary_time_series = []
+    while hi < n:
+        _, x0, y0, z0 = _read_tracked_point_with_cache(tracked_points, lo, points_cache)
+        timestamp, x1, y1, z1 = _read_tracked_point_with_cache(tracked_points, hi, points_cache)
+
+        if start_time is None:
+            start_time = timestamp
+
+        if lo == 0:
+            window_distance, window_time = _cumulative_distance_and_time(tracked_points, lo, hi, points_cache)
+            cumulative_distance += window_distance
+            cumulative_time += window_time
+        else:
+            incremental_distance, incremental_time \
+                = _cumulative_distance_and_time(tracked_points, hi - 1, hi, points_cache)
+            cumulative_distance += incremental_distance
+            cumulative_time += incremental_time
+
+        net_xy_distance = math.hypot((x1 - x0), (y1 - y0))
+        grade_pct = 100.0 * (z1 - z0) / net_xy_distance
+        if grade_pct > max_grade:
+            max_grade = grade_pct
+            max_grade_index = hi
+        if grade_pct < min_grade:
+            min_grade = grade_pct
+            min_grade_index = hi
+
+        summary_time_series.append((timestamp, cumulative_time, cumulative_distance, z1, grade_pct))
+
+        lo += 1
+        hi += 1
+
+    log.info("Max grade: %s at point %d of %d (%f %%)", max_grade, max_grade_index, n, 100.0 * max_grade_index / n)
+    log.info("Min grade: %s at point %d of %d (%f %%)", min_grade, min_grade_index, n, 100.0 * min_grade_index / n)
+
+    return summary_time_series
+
+
+def _preprocess_xml(gpx_file):
+    # Avoid XML namespace misery: see https://stackoverflow.com/a/25920989
+    it = ElementTree.iterparse(gpx_file)
+    for _, el in it:
+        _, _, el.tag = el.tag.rpartition('}')  # strip ns
+    return it.root
+
+
+def _read_tracked_point_with_cache(tracked_points: list, index: int, points_cache: dict):
+    cached = points_cache.get(index)
+    if cached is not None:
+        return cached
+
+    point_summary = _read_tracked_point(tracked_points[index])
+    points_cache[index] = point_summary
+
+    return point_summary
+
+
+def _read_tracked_point(trkpt_element):
+
+    time = datetime.datetime.fromisoformat(trkpt_element.find('time').text)
+    z = float(trkpt_element.find('ele').text)
+
+    latitude, longitude = (float(trkpt_element.attrib[k]) for k in ('lat', 'lon'))
+    x, y = (k * METERS_PER_DEGREE for k in (latitude, longitude))
+
+    return time, x, y, z
+
+
+def _cumulative_distance_and_time(tracked_points, start, end, points_cache):
+    cumulative_distance = 0
+    cumulative_time = 0
+    timestamp0, x0, y0, z0 = _read_tracked_point_with_cache(tracked_points, start, points_cache)
+    for i in range(start + 1, end + 1):
+        timestamp1, x1, y1, z1 = _read_tracked_point_with_cache(tracked_points, i, points_cache)
+
+        cumulative_distance += math.hypot(x1 - x0, y1 - y0, z1 - z0)
+        cumulative_time += (timestamp1 - timestamp0).total_seconds()
+
+        timestamp0, x0, y0, z0 = timestamp1, x1, y1, z1
+
+    return cumulative_distance, cumulative_time
+
+
+def _plot_results(summary_time_series):
+    cumulative_time = [k[1] / 60.0 for k in summary_time_series]
+    cumulative_distance = [k[2] / 1000.0 for k in summary_time_series]
+    elevation = [k[3] for k in summary_time_series]
+    grade = [k[4] for k in summary_time_series]
+
+    # Plot by cumulative distance
+    x_label = "Distance (km)"
+
+    fig, ax = plt.subplots(2, 1)
+    ax[0].set_ylabel("Elevation (m)")
+    ax[0].plot(cumulative_distance, elevation)
+    ax[0].set_xlabel(x_label)
+    ax[1].set_ylabel("Grade (%)")
+    ax[1].plot(cumulative_distance, grade)
+    ax[1].set_xlabel(x_label)
+
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
